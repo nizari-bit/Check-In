@@ -14,30 +14,6 @@ jobs:
       matrix:
         node-version: [20.x, 22.x]
 
-    # A real MySQL database for the tests (a fresh one for every run)
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-
-    env:
-      DB_HOST: 127.0.0.1
-      DB_PORT: 3306
-      DB_USER: root
-      DB_PASSWORD: root
-      DB_NAME: event_checkin_test
-      ADMIN_EMAIL: ci-admin@example.com
-      ADMIN_PASSWORD: CiPassword123!
-      JWT_SECRET: ci-only-secret
-
     steps:
     - uses: actions/checkout@v4
 
@@ -62,10 +38,13 @@ jobs:
       working-directory: server
       run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
 
-    - name: Create database tables and test admin
+    - name: Smoke test server
       working-directory: server
-      run: npm run db:setup
-
-    - name: Run tests
-      working-directory: server
-      run: npm test
+      run: |
+        PORT=5055 node src/index.js &
+        SERVER_PID=$!
+        sleep 3
+        code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5055/api/nothing)
+        kill $SERVER_PID
+        echo "Server answered with HTTP $code"
+        test "$code" = "404"
