@@ -41,3 +41,24 @@ export function parseCardType(v) {
   const s = String(v ?? '').trim().toLowerCase();
   return ['double', '2', 'couple', 'plus one', 'plus_one', '+1'].includes(s) ? 'double' : 'single';
 }
+
+/** "  John   MWAKYUSA " -> "john mwakyusa" (ignores capitals, extra spaces and accents) */
+export const normName = (v) =>
+  String(v ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+/** Comparable phone digits: "+255 712 345 678", "0712345678" and "712345678" all become "712345678" */
+export function normPhone(v) {
+  const d = String(v ?? '').replace(/\D/g, '');
+  return d.length > 9 ? d.slice(-9) : d;
+}
+
+/**
+ * Same person = same name AND (same phone, or a phone is missing on either side).
+ * Two people with the same name but different phone numbers are different guests.
+ */
+export function isSameGuest(a, b) {
+  if (normName(a.full_name) !== normName(b.full_name)) return false;
+  const pa = normPhone(a.phone);
+  const pb = normPhone(b.phone);
+  return !pa || !pb || pa === pb;
+}

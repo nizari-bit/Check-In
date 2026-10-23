@@ -5,7 +5,12 @@ import { pool } from '../db.js';
 import { signToken, requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const limiter = rateLimit({ 
+  windowMs: 15 * 60 * 1000, 
+  limit: 20, 
+  standardHeaders: true, 
+  legacyHeaders: false 
+});
 
 router.post('/login', limiter, async (req, res, next) => {
   try {

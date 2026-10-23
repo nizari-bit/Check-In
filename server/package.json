@@ -5,9 +5,12 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "db:setup": "node src/scripts/migrate.js && node src/scripts/seedAdmin.js"
+    "db:setup": "node src/scripts/migrate.js && node src/scripts/seedAdmin.js",
+    "test": "node --test",
+    "test:unit": "node --test test/utils.test.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.13",
     "archiver": "^7.0.1",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
@@ -20,5 +23,8 @@
     "multer": "^1.4.5-lts.1",
     "mysql2": "^3.11.3",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "jsqr": "^1.4.0"
   }
 }

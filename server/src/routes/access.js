@@ -8,13 +8,16 @@ import { isEventAccessOpen } from '../utils.js';
 const router = Router();
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
-// Extra protection: lock an event's login for 15 minutes after 10 wrong PINs
+// Extra protection: lock an event's login for 30 minutes after 10 wrong PINs
 const failures = new Map();
-const LOCK_MS = 15 * 60 * 1000;
+const LOCK_MS = 13 * 60 * 1000;
 
 async function findByToken(token) {
   if (!/^[0-9a-f]{48}$/.test(token)) return null;
+
+
   const [rows] = await pool.query('SELECT * FROM events WHERE access_token = ?', [token]);
+
   return rows[0] || null;
 }
 
@@ -22,8 +25,15 @@ async function findByToken(token) {
 router.get('/:token', async (req, res, next) => {
   try {
     const event = await findByToken(req.params.token);
-    if (!event) return res.status(404).json({ error: 'This link is not valid' });
-    if (!isEventAccessOpen(event)) return res.status(410).json({ error: 'This link is no longer active' });
+
+    if (!event) {
+      return res.status(404).json({ error: 'This link is not valid' });
+    }
+
+    if (!isEventAccessOpen(event)) {
+      return res.status(410).json({ error: 'This link is no longer active' });
+    }
+
     res.json({ name: event.name, event_date: event.event_date, venue: event.venue });
   } catch (e) { next(e); }
 });
@@ -31,8 +41,12 @@ router.get('/:token', async (req, res, next) => {
 router.post('/:token/login', limiter, async (req, res, next) => {
   try {
     const event = await findByToken(req.params.token);
-    if (!event) return res.status(404).json({ error: 'This link is not valid' });
-    if (!isEventAccessOpen(event)) return res.status(410).json({ error: 'This link is no longer active' });
+    if (!event) {
+      return res.status(404).json({ error: 'This link is not valid' });
+    }
+    if (!isEventAccessOpen(event)) {
+      return res.status(410).json({ error: 'This link is no longer active' });
+    }
 
     const f = failures.get(event.id);
     if (f && f.count >= 10 && Date.now() < f.until) {

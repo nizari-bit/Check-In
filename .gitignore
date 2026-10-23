@@ -1,0 +1,13 @@
+node_modules
+dist
+.env
+
+# GitHub Actions self-hosted runner
+/actions-runner/
+
+# Production environment variables
+.env.*
+!.env.example
+
+# Runtime cache of Google Fonts used by generated cards
+/server/assets/card/fonts/google/

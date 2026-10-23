@@ -53,9 +53,19 @@ export const api = {
   get: (p, auth) => request(p, { auth }),
   post: (p, body, auth) => request(p, { method: 'POST', body: body ?? {}, auth }),
   put: (p, body, auth) => request(p, { method: 'PUT', body, auth }),
-  del: (p, auth) => request(p, { method: 'DELETE', auth }),
+  del: (p, auth, body) => request(p, { method: 'DELETE', body, auth }),
   upload: (p, form, auth) => request(p, { method: 'POST', form, auth }),
 };
+
+export async function fetchBlobUrl(path) {
+  const res = await request(path, { auth: 'admin', raw: true });
+  return URL.createObjectURL(await res.blob());
+}
+
+export async function fetchBlob(path) {
+  const res = await request(path, { auth: 'admin', raw: true });
+  return res.blob();
+}
 
 export async function downloadFile(path, filename) {
   const res = await request(path, { auth: 'admin', raw: true });
