@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 import { pool } from "../db.js";
 import { requireScanner } from "../middleware/auth.js";
 import { normalizeCode, capacityOf } from "../utils.js";
+import { openStream, publish } from "../realtime.js";
 
 const router = Router();
 router.use(
@@ -76,6 +77,29 @@ async function findGuest(rawCode, eventId) {
   return { status, code, guest };
 }
 
+// Live counters for the door staff (kept open by the app; see realtime.js)
+router.get("/stream", (req, res) => openStream(req, res, req.event.id, "scanner"));
+
+// Tell everyone watching, AFTER the scanner already has its answer (so it never slows a scan down)
+async function announceCheckin(eventId, guest) {
+  try {
+    publish(
+      eventId,
+      {
+        type: "checkin",
+        code: guest.code,
+        admitted_count: guest.admitted_count,
+        checked_in_at: guest.checked_in_at,
+        capacity: guest.capacity,
+      },
+      null,
+    );
+    publish(eventId, null, { type: "stats", ...(await stats(eventId)) });
+  } catch (e) {
+    console.warn("[live] could not announce a check-in:", e.message);
+  }
+}
+
 router.get("/event", async (req, res, next) => {
   try {
     const { name, event_date, venue } = req.event;
@@ -119,8 +143,11 @@ router.post("/checkin", async (req, res, next) => {
     );
 
     const after = await findGuest(found.code, req.event.id);
-    if (r.affectedRows === 1)
-      return res.json({ ...after, status: "checked_in", admitted_now: count });
+    if (r.affectedRows === 1) {
+      res.json({ ...after, status: "checked_in", admitted_now: count });
+      announceCheckin(req.event.id, after.guest);
+      return;
+    }
     res.json(
       after.status === "already" ? after : { ...after, status: "too_many" },
     );

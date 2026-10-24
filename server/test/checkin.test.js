@@ -83,7 +83,7 @@ async function uploadTemplate(eventId, color = "#f7f4ef") {
 before(async () => {
   server = spawn(process.execPath, ["src/index.js"], {
     cwd: serverDir,
-    env: { ...process.env, PORT },
+    env: { ...process.env, PORT, GOOGLE_FONTS: "", GOOGLE_FONTS_API_KEY: "" },
     stdio: "ignore",
   });
   for (let i = 0; i < 40; i++) {
@@ -564,4 +564,208 @@ test("cards ZIP: unknown event gives 404", async () => {
     (await getBinary("/admin/events/99999999/cards.zip")).status,
     404,
   );
+});
+
+// ---------- Fonts: friendly messages, and a font problem never stops a card ----------
+async function saveLayout(eventId, fields) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) form.append(k, String(v));
+  const res = await fetch(`${BASE}/admin/events/${eventId}/card-template`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${adminToken}` },
+    body: form,
+  });
+  return { status: res.status, data: await res.json() };
+}
+const dayToday = () => new Date().toISOString().slice(0, 10);
+
+test("fonts: when the font list is unavailable the message is short and friendly", async () => {
+  const r = await admin("GET", "/admin/fonts");
+  assert.equal(r.status, 503);
+  assert.equal(r.data.code, "not_configured");
+  assert.match(r.data.error, /default font/i);
+  assert.doesNotMatch(r.data.error, /api key|googleapis|http|\d{3}|server/i, "no technical words in the message");
+});
+
+test("fonts: a chosen font is saved even if the list can't be reached, and the card still works", async () => {
+  const ev = (await admin("POST", "/admin/events", { name: "Font test", event_date: dayToday() })).data.event;
+  await uploadTemplate(ev.id);
+  const saved = await saveLayout(ev.id, { name_font_family: "Pacifico", name_font_variant: "regular", name_font_size: 48 });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.data.event.card_name_font_family, "Pacifico");
+  assert.match(saved.data.warning, /default font/i);
+
+  const g = await newGuest(ev.id, "Amina Salum");
+  const card = await getBinary(`/admin/guests/${g.id}/card.jpg`);
+  assert.equal(card.status, 200);
+  assert.equal((await readQr(card.buf)).text, g.code);
+  await admin("DELETE", `/admin/events/${ev.id}`);
+});
+
+test("fonts: choosing only a font family or only a style is refused politely", async () => {
+  const saved = await saveLayout(event.id, { name_font_family: "Pacifico" });
+  assert.equal(saved.status, 400);
+  assert.match(saved.data.error, /font/i);
+});
+
+// ---------- Cards: speed options and a missing template file ----------
+test("card preview: ?w= gives a smaller, lighter picture; the download stays full size", async () => {
+  const g = await newGuest(event.id, "Preview Person");
+  const small = await getBinary(`/admin/guests/${g.id}/card.jpg?w=600`);
+  const full = await getBinary(`/admin/guests/${g.id}/card.jpg`);
+  assert.equal(small.status, 200);
+  assert.equal((await readQr(full.buf)).width, 1191);
+  const img = await loadImage(small.buf);
+  assert.equal(img.width, 600);
+  assert.ok(small.buf.length < full.buf.length, "the preview should be lighter than the full card");
+  assert.equal((await getBinary(`/admin/guests/${g.id}/card.jpg?w=99999`)).status, 200); // silly sizes fall back to full size
+});
+
+test("card: the same card asked twice gives identical bytes (served from memory)", async () => {
+  const g = await newGuest(event.id, "Cache Person");
+  const a = await getBinary(`/admin/guests/${g.id}/card.jpg`);
+  const b = await getBinary(`/admin/guests/${g.id}/card.jpg`);
+  assert.deepEqual(a.buf, b.buf);
+});
+
+test("card: if the template file has gone missing, the message says what to do", async () => {
+  const fs = await import("node:fs");
+  const ev = (await admin("POST", "/admin/events", { name: "Missing template", event_date: dayToday() })).data.event;
+  const withTemplate = await uploadTemplate(ev.id);
+  const g = await newGuest(ev.id, "Lost Template");
+  fs.unlinkSync(path.join(serverDir, withTemplate.card_template_path));
+
+  const card = await getBinary(`/admin/guests/${g.id}/card.jpg`);
+  assert.equal(card.status, 409);
+  assert.match(card.buf.toString(), /upload it again/i);
+  const zip = await getBinary(`/admin/events/${ev.id}/cards.zip`);
+  assert.equal(zip.status, 409);
+  await admin("DELETE", `/admin/events/${ev.id}`);
+});
+
+test("health check answers without logging in", async () => {
+  const res = await fetch(`${BASE}/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true });
+});
+
+// ---------- Live updates ----------
+function openLive(url, token) {
+  const controller = new AbortController();
+  const messages = [];
+  const state = { status: null, ended: false };
+  (async () => {
+    try {
+      const res = await fetch(BASE + url, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
+      state.status = res.status;
+      if (!res.ok) return;
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of res.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let i;
+        while ((i = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, i);
+          buffer = buffer.slice(i + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data:"));
+          if (line) messages.push(JSON.parse(line.slice(5)));
+        }
+      }
+      state.ended = true;
+    } catch { /* closed by the test */ }
+  })();
+  const waitFor = async (pred, ms = 3000) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      const hit = messages.find(pred);
+      if (hit) return hit;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return null;
+  };
+  return { messages, state, waitFor, close: () => controller.abort() };
+}
+async function connected(url, token) {
+  const live = openLive(url, token);
+  assert.ok(await live.waitFor((m) => m.type === "hello"), "the live connection should open");
+  return live;
+}
+
+test("live: you need to be logged in, and the right kind of login", async () => {
+  const nobody = openLive(`/admin/events/${event.id}/stream`, "nope");
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(nobody.state.status, 401);
+  const wrongRole = openLive(`/admin/events/${event.id}/stream`, scannerToken);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(wrongRole.state.status, 401);
+  const noScanner = openLive("/scan/stream", adminToken);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(noScanner.state.status, 401);
+});
+
+test("live: a scan reaches the admin list and the door counters immediately", async () => {
+  const adminLive = await connected(`/admin/events/${event.id}/stream`, adminToken);
+  const doorLive = await connected("/scan/stream", scannerToken);
+  const g = await newGuest(event.id, "Live Person", "double");
+  await adminLive.waitFor((m) => m.type === "refresh"); // adding a guest tells the list to reload
+
+  const r = await scan("POST", "/scan/checkin", { code: g.code, count: 1 });
+  assert.equal(r.data.status, "checked_in");
+
+  const got = await adminLive.waitFor((m) => m.type === "checkin" && m.code === g.code);
+  assert.ok(got, "the admin list should hear about the scan");
+  assert.equal(got.admitted_count, 1);
+  assert.equal(got.capacity, 2);
+  assert.ok(got.checked_in_at);
+
+  const stats = await doorLive.waitFor((m) => m.type === "stats");
+  assert.ok(stats, "door staff should get fresh counters");
+  assert.ok(stats.arrived >= 1 && stats.total >= stats.arrived && stats.cards >= 1);
+  assert.equal(doorLive.messages.some((m) => m.code), false, "door staff never receive guest codes");
+
+  adminLive.close(); doorLive.close();
+});
+
+test("live: undo, edit, delete and import all update the list", async () => {
+  const adminLive = await connected(`/admin/events/${event.id}/stream`, adminToken);
+  const g = await newGuest(event.id, "Undo Person");
+  await scan("POST", "/scan/checkin", { code: g.code, count: 1 });
+  await adminLive.waitFor((m) => m.type === "checkin" && m.code === g.code);
+
+  await admin("POST", `/admin/guests/${g.id}/undo-checkin`);
+  const undo = await adminLive.waitFor((m) => m.type === "undo" && m.code === g.code);
+  assert.ok(undo);
+  assert.equal(undo.admitted_count, 0);
+  assert.equal(undo.checked_in_at, null);
+
+  const before = adminLive.messages.filter((m) => m.type === "refresh").length;
+  await admin("PUT", `/admin/guests/${g.id}`, { full_name: "Undo Renamed", card_type: "single" });
+  await admin("DELETE", `/admin/guests/${g.id}`);
+  await importCsv(event.id, "full_name\nLive Import One\n");
+  for (let i = 0; i < 40 && adminLive.messages.filter((m) => m.type === "refresh").length < before + 3; i++) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(adminLive.messages.filter((m) => m.type === "refresh").length >= before + 3, "edit, delete and import should each trigger a reload");
+  adminLive.close();
+});
+
+test("live: another event's scans never show up", async () => {
+  const other = (await admin("POST", "/admin/events", { name: "Other live", event_date: dayToday() })).data.event;
+  const otherLive = await connected(`/admin/events/${other.id}/stream`, adminToken);
+  const g = await newGuest(event.id, "Not For Other");
+  await scan("POST", "/scan/checkin", { code: g.code, count: 1 });
+  await new Promise((r) => setTimeout(r, 500));
+  assert.equal(otherLive.messages.filter((m) => m.type !== "hello").length, 0);
+  otherLive.close();
+  await admin("DELETE", `/admin/events/${other.id}`);
+});
+
+test("live: switching access off ends the door staff's live connection", async () => {
+  const doorLive = await connected("/scan/stream", scannerToken);
+  const adminLive = await connected(`/admin/events/${event.id}/stream`, adminToken);
+  await admin("POST", `/admin/events/${event.id}/access`, { active: false });
+  assert.ok(await doorLive.waitFor((m) => m.type === "closed"), "the door connection should be told it was closed");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(doorLive.state.ended, true);
+  assert.equal(adminLive.state.ended, false, "the admin keeps their live connection");
+  await admin("POST", `/admin/events/${event.id}/access`, { active: true });
+  adminLive.close();
 });

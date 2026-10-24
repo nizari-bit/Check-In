@@ -12,8 +12,25 @@ const fileName = (g) =>
       .slice(0, 40) || "guest"
   }.jpg`;
 
+// ---- Speed: previews are small pictures, remembered for this visit, and can be fetched before you click ----
+const PREVIEW_WIDTH = 640;
+const previews = new Map(); // key -> Promise<Blob> (the most recent 40)
+
+const previewKey = (guest, version) => `${guest.id}|${guest.code}|${guest.full_name}|${version}`;
+
+/** Starts loading a guest's preview in the background (call it when the mouse is over the Card button) */
+export function prefetchCard(guest, version = "") {
+  const key = previewKey(guest, version);
+  if (previews.has(key)) return previews.get(key);
+  const promise = fetchBlob(`/admin/guests/${guest.id}/card.jpg?w=${PREVIEW_WIDTH}`);
+  previews.set(key, promise);
+  promise.catch(() => previews.delete(key)); // a failed try is not remembered
+  while (previews.size > 40) previews.delete(previews.keys().next().value);
+  return promise;
+}
+
 /** Shows one guest's invitation card (design + their name + their QR) with download and share buttons */
-export default function CardModal({ guest, onClose }) {
+export default function CardModal({ guest, version = "", onClose }) {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
   const [sharing, setSharing] = useState(false);
@@ -23,7 +40,7 @@ export default function CardModal({ guest, onClose }) {
     let objectUrl = "";
     setUrl("");
     setError("");
-    fetchBlob(`/admin/guests/${guest.id}/card.jpg`)
+    prefetchCard(guest, version)
       .then((blob) => {
         if (!alive) return;
         objectUrl = URL.createObjectURL(blob);
@@ -36,7 +53,7 @@ export default function CardModal({ guest, onClose }) {
       alive = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [guest.id]);
+  }, [guest.id, guest.full_name, version]);
 
   // On phones this opens the share sheet (WhatsApp, Messages, ...) with the card attached
   const canShare =

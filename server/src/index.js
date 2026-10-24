@@ -19,6 +19,9 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// Quick "is it awake?" check (no database). Handy for an uptime pinger so the server never falls asleep.
+app.get("/api/health", (req, res) => res.json({ ok: true }));
+
 app.use("/api/admin", adminAuth);
 app.use("/api/admin", events);
 app.use("/api/admin", guests);
@@ -29,6 +32,8 @@ app.use("/api", (req, res) => res.status(404).json({ error: "Not found" }));
 // Serve the built React app in production (npm run build)
 const dist = path.resolve(__dirname, "../../client/dist");
 if (fs.existsSync(dist)) {
+  // The built files in /assets have a fingerprint in their name, so browsers can keep them for a year
+  app.use("/assets", express.static(path.join(dist, "assets"), { maxAge: "1y", immutable: true }));
   app.use(express.static(dist));
   app.use((req, res, next) =>
     req.method === "GET" ? res.sendFile(path.join(dist, "index.html")) : next(),

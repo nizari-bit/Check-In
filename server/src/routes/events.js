@@ -9,6 +9,7 @@ import { config } from '../config.js';
 import { requireAdmin } from '../middleware/auth.js';
 import { newToken, newPin, clean, eventExpiry, isEventAccessOpen } from '../utils.js';
 import { GoogleFontsError, listGoogleFonts } from '../googleFonts.js';
+import { closeStreams } from '../realtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const uploadDir = path.resolve(__dirname, '../../assets/card');
@@ -73,8 +74,13 @@ router.get('/fonts', async (_req, res) => {
   try {
     res.set('Cache-Control', 'private, max-age=3600').json(await listGoogleFonts());
   } catch (error) {
-    res.status(error instanceof GoogleFontsError ? error.status : 502)
-      .json({ error: error.message || 'Could not load Google Fonts' });
+    // Short and friendly for people; the technical reason is already in the server log
+    const known = error instanceof GoogleFontsError;
+    if (!known) console.error(error);
+    res.set('Cache-Control', 'no-store').status(known ? error.status : 503).json({
+      error: known ? error.message : new GoogleFontsError('unavailable').message,
+      code: known ? error.code : 'unavailable',
+    });
   }
 });
 
@@ -206,17 +212,21 @@ router.post('/events/:id/card-template', templateUpload.single('image'), async (
     if (!Number.isFinite(nextLayout.name_font_size) || nextLayout.name_font_size < 8 || nextLayout.name_font_size > 160) {
       return res.status(400).json({ error: 'Guest name font size must be between 8 and 160 pixels' });
     }
+    let warning = null;
     if (fontFamily) {
-      let fonts;
+      let fonts = null;
       try {
         fonts = await listGoogleFonts();
       } catch (error) {
-        if (error instanceof GoogleFontsError) return res.status(error.status).json({ error: error.message });
-        throw error;
+        if (!(error instanceof GoogleFontsError)) throw error;
+        // The font list can't be reached right now. Save anyway: cards use the default font until the chosen one can be loaded.
+        warning = 'Your settings were saved, but we could not check the chosen font just now. If it cannot be loaded, the default font is used on the cards.';
       }
-      const selectedFont = fonts.find((font) => font.family === fontFamily);
-      if (!selectedFont?.variants.includes(fontVariant)) {
-        return res.status(400).json({ error: 'The selected Google font style is not available' });
+      if (fonts) {
+        const selectedFont = fonts.find((font) => font.family === fontFamily);
+        if (!selectedFont?.variants.includes(fontVariant)) {
+          return res.status(400).json({ error: 'That font style is not available. Please choose another style.' });
+        }
       }
     }
 
@@ -253,7 +263,7 @@ router.post('/events/:id/card-template', templateUpload.single('image'), async (
     }
 
     const updated = await loadEvent(req.params.id);
-    res.json({ ok: true, event: present(updated) });
+    res.json({ ok: true, event: present(updated), ...(warning ? { warning } : {}) });
   } catch (e) {
     next(e);
   }
@@ -284,6 +294,7 @@ router.delete('/events/:id', async (req, res, next) => {
     const [rows] = await pool.query('SELECT card_template_path FROM events WHERE id = ?', [req.params.id]);
     await pool.query('DELETE FROM events WHERE id = ?', [req.params.id]);
     removeTemplateFile(rows[0]?.card_template_path);
+    closeStreams(req.params.id);
 
     res.json({ 
       ok: true 
@@ -297,6 +308,7 @@ router.delete('/events/:id', async (req, res, next) => {
 router.post('/events/:id/access', async (req, res, next) => {
   try {
     await pool.query('UPDATE events SET access_active = ? WHERE id = ?', [req.body?.active ? 1 : 0, req.params.id]);
+    if (!req.body?.active) closeStreams(req.params.id, 'scanner');
 
     res.json(present(await loadEvent(req.params.id)));
 
@@ -326,6 +338,7 @@ router.post('/events/:id/reset-pin', async (req, res, next) => {
 router.post('/events/:id/regenerate-link', async (req, res, next) => {
   try {
     await pool.query('UPDATE events SET access_token = ? WHERE id = ?', [newToken(), req.params.id]);
+    closeStreams(req.params.id, 'scanner');
 
     res.json(present(await loadEvent(req.params.id)));
 

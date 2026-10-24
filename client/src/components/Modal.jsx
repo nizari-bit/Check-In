@@ -22,7 +22,7 @@ export default function Modal({ title, onClose, children, wide, extraWide, mobil
           )}
         </div>
         {mobileFullScreen
-          ? <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 sm:overflow-visible sm:px-0 sm:pb-0">{children}</div>
+          ? <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 sm:px-0 sm:pb-0">{children}</div>
           : children}
       </div>
     </div>

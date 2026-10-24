@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api, fmtTime, scannerSession } from "../api.js";
 import Camera from "../components/Camera.jsx";
 import { beep } from "../beep.js";
+import { openLive } from "../live.js";
 
 const THEMES = {
   ok: { bg: "bg-ok", fg: "text-white", icon: "✓", title: "Valid invitation" },
@@ -196,6 +197,28 @@ export default function Scanner() {
   useEffect(() => {
     if (!session) nav("/", { replace: true });
     else loadInfo();
+  }, []);
+
+  // The "x of y people in" counter follows every scan made by ANY scanner, as it happens
+  useEffect(() => {
+    if (!session) return undefined;
+    const slow = setInterval(loadInfo, 60000); // safety net
+    let opened = false;
+    const stop = openLive("/scan/stream", "scanner", {
+      onOpen: () => {
+        if (opened) loadInfo(); // after a reconnect, catch up
+        opened = true;
+      },
+      onMessage: (m) => {
+        if (m.type === "stats")
+          setInfo((i) => (i ? { ...i, cards: m.cards, total: m.total, arrived: m.arrived } : i));
+        else if (m.type === "refresh") loadInfo();
+      },
+    });
+    return () => {
+      clearInterval(slow);
+      stop();
+    };
   }, []);
   if (!session) return null;
 

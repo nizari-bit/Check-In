@@ -1,4 +1,5 @@
 import { Router } from "express";
+import fs from "fs";
 import path from "path";
 import multer from "multer";
 import archiver from "archiver";
@@ -16,6 +17,7 @@ import {
   normPhone,
 } from "../utils.js";
 import { renderCard, cardFileName } from "../card.js";
+import { openStream, publish } from "../realtime.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -96,6 +98,20 @@ function readGuest(body = {}) {
   };
 }
 
+// Live updates for the admin guest list (kept open by the app; see realtime.js)
+router.get("/events/:id/stream", async (req, res, next) => {
+  try {
+    if (!(await eventExists(req.params.id)))
+      return res.status(404).json({ error: "Event not found" });
+    openStream(req, res, req.params.id, "admin");
+  } catch (e) {
+    next(e);
+  }
+});
+
+// "Something about the guest list changed: reload it" (add, edit, delete, import)
+const announceChange = (eventId) => publish(eventId, { type: "refresh" }, { type: "refresh" });
+
 router.get("/events/:id/guests", async (req, res, next) => {
   try {
     const [rows] = await pool.query(
@@ -128,6 +144,7 @@ router.delete("/events/:id/guests", async (req, res, next) => {
       "DELETE FROM guests WHERE event_id = ? AND id IN (?)",
       [req.params.id, [...new Set(ids)]],
     );
+    if (result.affectedRows) announceChange(req.params.id);
     res.json({ ok: true, deleted: result.affectedRows });
   } catch (e) {
     next(e);
@@ -148,6 +165,7 @@ router.post("/events/:id/guests", async (req, res, next) => {
         });
     }
     const { id, code } = await insertGuest(req.params.id, guest);
+    announceChange(req.params.id);
     res.status(201).json({ id, code, ...guest });
   } catch (e) {
     next(e);
@@ -159,7 +177,7 @@ router.put("/guests/:id", async (req, res, next) => {
     const { error, guest } = readGuest(req.body);
     if (error) return res.status(400).json({ error });
     const [cur] = await pool.query(
-      "SELECT admitted_count FROM guests WHERE id = ?",
+      "SELECT admitted_count, event_id FROM guests WHERE id = ?",
       [req.params.id],
     );
     if (!cur[0]) return res.status(404).json({ error: "Guest not found" });
@@ -181,6 +199,7 @@ router.put("/guests/:id", async (req, res, next) => {
         req.params.id,
       ],
     );
+    announceChange(cur[0].event_id);
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -189,7 +208,9 @@ router.put("/guests/:id", async (req, res, next) => {
 
 router.delete("/guests/:id", async (req, res, next) => {
   try {
+    const [cur] = await pool.query("SELECT event_id FROM guests WHERE id = ?", [req.params.id]);
     await pool.query("DELETE FROM guests WHERE id = ?", [req.params.id]);
+    if (cur[0]) announceChange(cur[0].event_id);
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -198,10 +219,18 @@ router.delete("/guests/:id", async (req, res, next) => {
 
 router.post("/guests/:id/undo-checkin", async (req, res, next) => {
   try {
+    const [cur] = await pool.query("SELECT code, event_id, card_type FROM guests WHERE id = ?", [req.params.id]);
     await pool.query(
       "UPDATE guests SET checked_in_at = NULL, admitted_count = 0 WHERE id = ?",
       [req.params.id],
     );
+    if (cur[0]) {
+      publish(
+        cur[0].event_id,
+        { type: "undo", code: cur[0].code, admitted_count: 0, checked_in_at: null, capacity: capacityOf(cur[0].card_type) },
+        { type: "refresh" },
+      );
+    }
     res.json({ ok: true });
   } catch (e) {
     next(e);
@@ -357,6 +386,7 @@ router.post(
       }
 
       for (const guest of fresh) await insertGuest(eventId, guest);
+      if (fresh.length) announceChange(eventId);
       res.json({ imported: fresh.length, skipped });
     } catch (e) {
       next(e);
@@ -423,7 +453,12 @@ router.get("/guests/:id/card.jpg", async (req, res, next) => {
       return res.status(400).json({ error: "Upload a card template for this event before generating cards" });
     }
 
+    // ?w=640 gives a small, quick picture for on-screen previews; without it you get the full-size card
+    const width = Math.round(Number(req.query.w));
+    const maxWidth = Number.isFinite(width) && width >= 200 && width <= 2400 ? width : undefined;
+
     const jpg = await renderCard({
+      maxWidth,
       name: rows[0].full_name,
       code: rows[0].code,
       templatePath: rows[0].card_template_path ? path.resolve(process.cwd(), rows[0].card_template_path) : null,
@@ -446,6 +481,7 @@ router.get("/guests/:id/card.jpg", async (req, res, next) => {
 
     res.type("jpeg").send(jpg);
   } catch (e) {
+    if (e.code === "TEMPLATE_MISSING") return res.status(e.status).json({ error: e.message });
     next(e);
   }
 });
@@ -457,6 +493,10 @@ router.get("/events/:id/cards.zip", async (req, res, next) => {
     if (!event) return res.status(404).json({ error: "Event not found" });
     if (!event.card_template_path) {
       return res.status(400).json({ error: "Upload a card template for this event before generating cards" });
+    }
+
+    if (!fs.existsSync(path.resolve(process.cwd(), event.card_template_path))) {
+      return res.status(409).json({ error: "This event's card template file is no longer on the server. Please open “Card template” and upload it again." });
     }
 
     const [guests] = await pool.query(
@@ -473,6 +513,7 @@ router.get("/events/:id/cards.zip", async (req, res, next) => {
     for (const g of guests) {
       if (res.destroyed) break;
       const jpg = await renderCard({
+        useCache: false,
         name: g.full_name,
         code: g.code,
         templatePath: g.card_template_path ? path.resolve(process.cwd(), g.card_template_path) : null,

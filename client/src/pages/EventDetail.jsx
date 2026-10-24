@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { api, downloadFile, fetchBlobUrl, fmtDate, fmtTime } from '../api.js';
-import CardModal from '../components/CardModal.jsx';
+import CardModal, { prefetchCard } from '../components/CardModal.jsx';
+import { openLive } from '../live.js';
 import AdminLayout from '../components/AdminLayout.jsx';
 import Modal from '../components/Modal.jsx';
 import EventForm from '../components/EventForm.jsx';
@@ -80,6 +81,20 @@ function NudgeControls({ label, onMove }) {
   );
 }
 
+// Short, friendly wording for people (the technical reason is only in the server log)
+function fontMessage(code) {
+  if (code === 'not_configured') {
+    return {
+      title: "Custom fonts aren't available yet",
+      text: 'Guest names will use the default font (Cormorant Garamond). You can still position everything and save your settings.',
+    };
+  }
+  return {
+    title: "We couldn't load the font list",
+    text: 'This is usually a short connection problem. Guest names will use the default font for now. You can still save your settings, or try again.',
+  };
+}
+
 function fontVariantLabel(variant) {
   const italic = variant.endsWith('italic');
   const weight = variant === 'regular' || variant === 'italic'
@@ -130,7 +145,8 @@ function TemplateModal({ event, onClose, onSave, onReset }) {
   const [zoom, setZoom] = useState(1);
   const [fontOptions, setFontOptions] = useState([]);
   const [loadingFonts, setLoadingFonts] = useState(true);
-  const [fontError, setFontError] = useState('');
+  const [fontError, setFontError] = useState(null); // null, or { title, text }
+  const fontsAlive = useRef(true);
   const [fontSearch, setFontSearch] = useState(defaults.name_font_family);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
   const [activeFontIndex, setActiveFontIndex] = useState(0);
@@ -151,13 +167,22 @@ function TemplateModal({ event, onClose, onSave, onReset }) {
     ? 400
     : Number(previewFontVariant.replace('italic', '')) || 400;
 
-  useEffect(() => {
-    let active = true;
+  const loadFonts = () => {
+    setLoadingFonts(true);
+    setFontError(null);
     api.get('/admin/fonts', 'admin')
-      .then((fonts) => { if (active) setFontOptions(fonts); })
-      .catch((err) => { if (active) setFontError(err.message); })
-      .finally(() => { if (active) setLoadingFonts(false); });
-    return () => { active = false; };
+      .then((fonts) => { if (fontsAlive.current) setFontOptions(fonts); })
+      .catch((err) => {
+        console.warn('Could not load the font list:', err.message);
+        if (fontsAlive.current) setFontError(fontMessage(err.data?.code));
+      })
+      .finally(() => { if (fontsAlive.current) setLoadingFonts(false); });
+  };
+
+  useEffect(() => {
+    fontsAlive.current = true;
+    loadFonts();
+    return () => { fontsAlive.current = false; };
   }, []);
 
   useEffect(() => {
@@ -405,9 +430,9 @@ function TemplateModal({ event, onClose, onSave, onReset }) {
                 ? `guest-name-font-option-${activeFontIndex}`
                 : undefined}
               autoComplete="off"
-              placeholder={loadingFonts ? 'Loading Google Fonts…' : 'Type to search Google Fonts'}
+              placeholder={loadingFonts ? 'Loading Google Fonts…' : fontError ? 'Default font in use' : 'Type to search Google Fonts'}
               value={fontSearch}
-              disabled={loadingFonts}
+              disabled={loadingFonts || Boolean(fontError)}
               onFocus={(e) => {
                 setFontMenuOpen(true);
                 e.currentTarget.select();
@@ -532,7 +557,13 @@ function TemplateModal({ event, onClose, onSave, onReset }) {
               required
             />
           </div>
-          {fontError && <p className="text-sm text-bad sm:col-span-3">{fontError}. The existing default font can still be used.</p>}
+          {fontError && (
+            <div className="rounded-lg bg-warn-light p-3 text-sm text-ink sm:col-span-3">
+              <p className="font-semibold">{fontError.title}</p>
+              <p className="mt-0.5 text-steel-dark">{fontError.text}</p>
+              <button type="button" className="mt-2 font-semibold text-teal-dark hover:underline" onClick={loadFonts}>Try again</button>
+            </div>
+          )}
         </div>
 
         <div ref={previewViewportRef} className="max-h-[40dvh] overflow-auto rounded-lg border border-mist bg-mist-100 p-2 text-center sm:max-h-[55vh] sm:p-3">
@@ -634,7 +665,7 @@ function TemplateModal({ event, onClose, onSave, onReset }) {
         )}
 
         <p className="text-xs text-steel">The QR overlay is a preview marker; generated cards will contain each guest’s actual scannable QR code.</p>
-        <div className="sticky bottom-0 -mx-4 flex flex-col-reverse gap-2 border-t border-mist bg-white/95 px-4 pb-2 pt-3 backdrop-blur sm:static sm:mx-0 sm:flex-row sm:justify-between sm:border-0 sm:bg-transparent sm:p-0 sm:backdrop-blur-none">
+        <div className="sticky bottom-0 z-10 -mx-4 flex flex-col-reverse gap-2 border-t border-mist bg-white px-4 pb-2 pt-3 sm:mx-0 sm:flex-row sm:justify-between sm:px-0 sm:pb-0">
           <button type="button" className="btn btn-secondary min-h-11 w-full text-bad sm:w-auto" disabled={busy || !event?.card_template_path} onClick={reset}>Reset template</button>
           <div className="flex gap-2">
             <button type="button" className="btn btn-secondary min-h-11 flex-1 sm:flex-none" onClick={onClose}>Cancel</button>
@@ -662,6 +693,10 @@ export default function EventDetail() {
   const [newPin, setNewPin] = useState(null);
   const [importResult, setImportResult] = useState(null);
   const [busy, setBusy] = useState('');
+  const [live, setLive] = useState('connecting'); // connecting | live | reconnecting | denied
+  const [flash, setFlash] = useState({}); // guest code -> true for a moment after a scan
+  const guestsRef = useRef([]);
+  const liveRef = useRef('connecting');
 
   const load = async () => {
     try {
@@ -669,7 +704,37 @@ export default function EventDetail() {
       setEvent(e); setGuests(g);
     } catch (err) { setError(err.message); }
   };
-  useEffect(() => { load(); const t = setInterval(load, 20000); return () => clearInterval(t); }, [id]);
+  useEffect(() => { guestsRef.current = guests; }, [guests]);
+
+  useEffect(() => {
+    load();
+    // Scans arrive instantly through the live connection. These reloads are only a safety net
+    // (a slow one always, a faster one while the live connection is down).
+    const slow = setInterval(load, 60000);
+    const fast = setInterval(() => { if (liveRef.current !== 'live') load(); }, 10000);
+    const wake = () => { if (document.visibilityState === 'visible') load(); };
+    document.addEventListener('visibilitychange', wake);
+
+    let opened = false;
+    const stop = openLive(`/admin/events/${id}/stream`, 'admin', {
+      onStatus: (status) => { liveRef.current = status; setLive(status); },
+      onOpen: () => { if (opened) load(); opened = true; }, // after a reconnect, catch up on anything missed
+      onMessage: (m) => {
+        if (m.type === 'refresh') { load(); return; }
+        if (m.type !== 'checkin' && m.type !== 'undo') return;
+        if (!guestsRef.current.some((g) => g.code === m.code)) { load(); return; }
+        setGuests((current) => current.map((g) => (g.code === m.code ? { ...g, admitted_count: m.admitted_count, checked_in_at: m.checked_in_at } : g)));
+        setFlash((f) => ({ ...f, [m.code]: true }));
+        setTimeout(() => setFlash((f) => { const rest = { ...f }; delete rest[m.code]; return rest; }), 2500);
+      },
+    });
+    return () => {
+      clearInterval(slow);
+      clearInterval(fast);
+      document.removeEventListener('visibilitychange', wake);
+      stop();
+    };
+  }, [id]);
 
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -680,6 +745,12 @@ export default function EventDetail() {
       return [g.full_name, g.phone, g.code, g.category, g.table_no].some((v) => String(v || '').toLowerCase().includes(q));
     });
   }, [guests, search, filter]);
+
+  const totals = useMemo(() => ({
+    cards: guests.length,
+    people: guests.reduce((n, g) => n + (g.capacity || 1), 0),
+    arrived: guests.reduce((n, g) => n + (g.admitted_count || 0), 0),
+  }), [guests]);
 
   const pageCount = Math.max(1, Math.ceil(shown.length / pageSize));
   const currentPage = Math.min(page, pageCount);
@@ -742,7 +813,9 @@ export default function EventDetail() {
   if (error) return <AdminLayout back={{ to: '/admin', label: 'All events' }}><p className="rounded-lg bg-bad-light p-3 text-bad">{error}</p></AdminLayout>;
   if (!event) return <AdminLayout><p className="text-steel">Loading…</p></AdminLayout>;
 
-  const pct = event.total_guests ? Math.round((event.arrived / event.total_guests) * 100) : 0;
+  const pct = totals.people ? Math.round((totals.arrived / totals.people) * 100) : 0;
+  const cardVersion = [event.card_template_path, event.card_name_x, event.card_name_y, event.card_name_width, event.card_name_font_size, event.card_name_font_family, event.card_name_font_variant, event.card_qr_x, event.card_qr_y, event.card_qr_size].join('|');
+  const warmCard = (g) => { if (event.card_template_path) prefetchCard(g, cardVersion).catch(() => {}); };
 
   return (
     <AdminLayout back={{ to: '/admin', label: 'All events' }}>
@@ -761,10 +834,10 @@ export default function EventDetail() {
 
       {/* Stats */}
       <div className="mb-2 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Stat label="Cards" value={event.total_cards} />
-        <Stat label="Expected people" value={event.total_guests} />
-        <Stat label="Arrived" value={event.arrived} tone="text-ok" />
-        <Stat label="Remaining" value={event.total_guests - event.arrived} tone="text-warn" />
+        <Stat label="Cards" value={totals.cards} />
+        <Stat label="Expected people" value={totals.people} />
+        <Stat label="Arrived" value={totals.arrived} tone="text-ok" />
+        <Stat label="Remaining" value={Math.max(0, totals.people - totals.arrived)} tone="text-warn" />
       </div>
       <div className="mb-6 h-2 overflow-hidden rounded-full bg-mist"><div className="h-full bg-ok transition-all" style={{ width: `${pct}%` }} /></div>
 
@@ -792,7 +865,11 @@ export default function EventDetail() {
       {/* Guests */}
       <section className="card">
         <div className="flex flex-wrap items-center gap-2 border-b border-mist p-4">
-          <h2 className="mr-auto font-bold">Guests</h2>
+          <h2 className="font-bold">Guests</h2>
+          <span className="mr-auto flex items-center gap-1.5 text-xs text-steel" title={live === 'live' ? 'New scans appear here instantly' : 'The list refreshes by itself'}>
+            <span className={`h-2 w-2 rounded-full ${live === 'live' ? 'bg-ok' : 'bg-warn'}`} />
+            {live === 'live' ? 'Live' : live === 'denied' ? 'Auto-refresh' : 'Reconnecting…'}
+          </span>
           <button className="btn btn-primary" onClick={() => setModal({ type: 'guest' })}>+ Add guest</button>
           <button className="btn btn-secondary" disabled={busy === 'import'} onClick={() => fileRef.current.click()}>{busy === 'import' ? 'Importing…' : 'Import CSV'}</button>
           <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={onImport} />
@@ -829,7 +906,7 @@ export default function EventDetail() {
             </thead>
             <tbody className="divide-y divide-mist">
               {pageGuests.map((g) => (
-                <tr key={g.id} className="hover:bg-mist-50">
+                <tr key={g.id} className={`transition-colors duration-700 hover:bg-mist-50 ${flash[g.code] ? 'bg-ok-light' : ''}`}>
                   <td className="px-4 py-2"><input type="checkbox" aria-label={`Select ${g.full_name}`} checked={selectedIds.includes(g.id)} onChange={(e) => setSelectedIds((current) => e.target.checked ? [...new Set([...current, g.id])] : current.filter((guestId) => guestId !== g.id))} /></td>
                   <td className="px-4 py-2 font-mono font-semibold">{g.code}</td>
                   <td className="px-4 py-2 font-medium">{g.full_name}</td>
@@ -844,7 +921,7 @@ export default function EventDetail() {
                   </td>
                   <td className="whitespace-nowrap px-4 py-2 text-right">
                     <button className="px-2 text-teal-dark hover:underline" onClick={() => setModal({ type: 'qr', guest: g })}>QR</button>
-                    <button className="px-2 text-teal-dark hover:underline" onClick={() => setModal({ type: 'card', guest: g })}>Card</button>
+                    <button className="px-2 text-teal-dark hover:underline" onMouseEnter={() => warmCard(g)} onFocus={() => warmCard(g)} onTouchStart={() => warmCard(g)} onClick={() => setModal({ type: 'card', guest: g })}>Card</button>
                     <button className="px-2 text-teal-dark hover:underline" onClick={() => setModal({ type: 'guest', guest: g })}>Edit</button>
                     {g.admitted_count > 0 && <button className="px-2 text-warn hover:underline" onClick={() => confirm(`Undo check-in for ${g.full_name}?`) && run('undo', async () => { await api.post(`/admin/guests/${g.id}/undo-checkin`, {}, 'admin'); load(); })}>Undo</button>}
                     <button className="px-2 text-bad hover:underline" onClick={() => confirm(`Delete ${g.full_name}?`) && run('gdel', async () => { await api.del(`/admin/guests/${g.id}`, 'admin'); load(); })}>Delete</button>
@@ -884,6 +961,7 @@ export default function EventDetail() {
           onSave={async (fd) => {
             const data = await api.upload(`/admin/events/${id}/card-template`, fd, 'admin');
             setEvent(data.event); setModal(null);
+            if (data.warning) alert(data.warning);
           }}
           onReset={async () => {
             const data = await api.post(`/admin/events/${id}/card-template/reset`, {}, 'admin');
@@ -916,7 +994,7 @@ export default function EventDetail() {
         </Modal>
       )}
 
-      {modal?.type === 'card' && <CardModal guest={modal.guest} onClose={() => setModal(null)} />}
+      {modal?.type === 'card' && <CardModal guest={modal.guest} version={cardVersion} onClose={() => setModal(null)} />}
 
       {newPin && (
         <Modal title="New PIN" onClose={() => setNewPin(null)}>
